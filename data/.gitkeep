@@ -1,0 +1,2 @@
+# 此目录用于存放数据库文件
+# .db 和 .sqlite 文件会被 .gitignore 排除

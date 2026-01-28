@@ -15,13 +15,15 @@ env/
 *.swp
 *.swo
 
-# 环境配置
+# 环境配置（敏感信息）
 .env
 .env.local
+.env.*.local
 
 # 数据库
 *.db
 *.sqlite
+polymarket.db
 
 # 日志
 *.log
@@ -31,6 +33,7 @@ logs/
 data/*.db
 data/*.json
 !data/.gitkeep
+!data/fixtures/.gitkeep
 !data/fixtures/
 
 # 系统文件
@@ -41,3 +44,6 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Node（如果前端有依赖）
+node_modules/
