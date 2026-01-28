@@ -1,10 +1,17 @@
 """
 阶段二：区块链索引器（Indexer）
 持续扫描Polymarket交易事件并存储到数据库
+
+功能：
+1. 获取 OrderFilled 事件日志
+2. 解析交易数据
+3. 存储到数据库
+4. 支持增量同步和持续监听
 """
 import logging
 import sys
 import json
+import time
 from typing import List, Dict, Optional, Tuple, Any
 from datetime import datetime
 import argparse
@@ -12,12 +19,13 @@ from dotenv import load_dotenv
 import os
 from web3 import Web3
 from decimal import Decimal
-import sqlite3
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from trade_decoder import TradeDecoder, Trade
 from market_decoder import MarketDecoder
 from db.schema import init_db, get_connection
+from indexer.store import DataStore
+from indexer.gamma import GammaAPIClient
 
 load_dotenv()
 logging.basicConfig(
@@ -34,11 +42,27 @@ class PolymarketIndexer:
     CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
     NEG_RISK_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
     
-    # 批处理大小
-    BATCH_SIZE = 1000
+    # OrderFilled 事件签名
+    # event OrderFilled(bytes32 indexed orderHash, address indexed maker, address indexed taker, 
+    #                   uint256 makerAssetId, uint256 takerAssetId, uint256 makerAmountFilled, 
+    #                   uint256 takerAmountFilled, uint256 fee)
+    ORDER_FILLED_TOPIC = "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6"
+    
+    # 批处理大小（区块数）- Polygon RPC 限制每次返回 10000 条日志
+    # Polymarket 交易量大，需要较小的批次
+    BATCH_SIZE = 50
+    
+    # Polygon 出块间隔（秒）
+    BLOCK_TIME = 2
     
     def __init__(self, rpc_url: str, db_path: str = "data/polymarket.db"):
-        """初始化索引器"""
+        """
+        初始化索引器
+        
+        Args:
+            rpc_url: Polygon RPC URL
+            db_path: SQLite 数据库路径
+        """
         logger.info("初始化索引器...")
         
         self.rpc_url = rpc_url
@@ -47,63 +71,42 @@ class PolymarketIndexer:
         
         # 验证RPC连接
         if not self.web3.is_connected():
-            raise ConnectionError("无法连接到Polygon RPC")
+            raise ConnectionError("无法连接到 Polygon RPC")
         
-        logger.info(f"✓ RPC连接成功: 链ID {self.web3.eth.chain_id}")
+        chain_id = self.web3.eth.chain_id
+        logger.info(f"✓ RPC 连接成功: 链ID {chain_id}")
+        
+        if chain_id != 137:
+            logger.warning(f"⚠ 非 Polygon 主网 (链ID: {chain_id})")
         
         # 初始化数据库
         init_db(db_path)
-        logger.info(f"✓ 数据库初始化完成")
+        logger.info(f"✓ 数据库初始化完成: {db_path}")
         
-        # 初始化解码器
+        # 初始化组件
+        self.store = DataStore(db_path)
         self.trade_decoder = TradeDecoder(rpc_url)
         self.market_decoder = MarketDecoder()
-    
-    def get_sync_state(self) -> Tuple[int, int]:
-        """
-        获取同步状态
+        self.gamma_client = GammaAPIClient()
         
-        Returns:
-            (最后处理区块, 总处理事件数)
-        """
-        try:
-            conn = get_connection(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute("SELECT last_block, total_events FROM sync_state LIMIT 1")
-            row = cursor.fetchone()
-            conn.close()
-            
-            if row:
-                return row[0], row[1]
-            else:
-                # 首次运行，从最近1000个区块开始
-                current_block = self.web3.eth.block_number
-                start_block = max(current_block - 1000, 0)
-                return start_block, 0
-        except Exception as e:
-            logger.error(f"获取同步状态失败: {e}")
-            return 0, 0
+        logger.info("✓ 索引器初始化完成")
     
-    def update_sync_state(self, block_num: int, event_count: int) -> None:
-        """更新同步状态"""
+    def get_current_block(self) -> int:
+        """获取当前区块高度"""
+        return self.web3.eth.block_number
+    
+    def get_block_timestamp(self, block_number: int) -> Optional[datetime]:
+        """获取区块时间戳"""
         try:
-            conn = get_connection(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                INSERT OR REPLACE INTO sync_state (id, last_block, total_events, last_updated)
-                VALUES (1, ?, ?, ?)
-            """, (block_num, event_count, datetime.now().isoformat()))
-            
-            conn.commit()
-            conn.close()
+            block = self.web3.eth.get_block(block_number)
+            return datetime.fromtimestamp(block['timestamp'])
         except Exception as e:
-            logger.error(f"更新同步状态失败: {e}")
+            logger.warning(f"获取区块时间戳失败: {e}")
+            return None
     
     def fetch_order_filled_logs(self, from_block: int, to_block: int) -> List[Dict]:
         """
-        获取OrderFilled事件日志
+        获取 OrderFilled 事件日志
         
         Args:
             from_block: 开始区块
@@ -113,12 +116,6 @@ class PolymarketIndexer:
             日志列表
         """
         try:
-            logger.info(f"获取区块 {from_block} - {to_block} 的事件...")
-            
-            # OrderFilled事件签名 (topic0)
-            # event OrderFilled(bytes32 indexed conditionId, uint256 indexed tokenId, ...)
-            event_topic = "0xb1c9d926dde9f4e10e6e183ccff5b35e41541a1e7b7ed7e7873e6e550fdb68a1"
-            
             logs = self.web3.eth.get_logs({
                 'fromBlock': from_block,
                 'toBlock': to_block,
@@ -126,146 +123,251 @@ class PolymarketIndexer:
                     Web3.to_checksum_address(self.CTF_EXCHANGE),
                     Web3.to_checksum_address(self.NEG_RISK_EXCHANGE)
                 ],
-                'topics': [event_topic]
+                'topics': [self.ORDER_FILLED_TOPIC]
             })
             
-            logger.info(f"✓ 获取到 {len(logs)} 个OrderFilled事件")
-            return logs
+            logger.debug(f"获取到 {len(logs)} 个 OrderFilled 事件")
+            return list(logs)
         
         except Exception as e:
-            logger.error(f"获取日志失败: {e}")
+            logger.error(f"获取日志失败 ({from_block}-{to_block}): {e}")
             return []
     
-    def process_logs(self, logs: List[Dict]) -> List[Dict]:
+    def parse_log_to_trade(self, log: Dict) -> Optional[Tuple[Trade, int]]:
         """
-        处理原始日志
+        直接解析单个日志为 Trade 对象
         
         Args:
-            logs: 原始日志
+            log: 日志对象
             
         Returns:
-            处理后的交易数据
+            (Trade 对象, block_number) 或 None
+        """
+        try:
+            tx_hash = log.get('transactionHash')
+            if hasattr(tx_hash, 'hex'):
+                tx_hash = tx_hash.hex()
+            
+            log_index = log.get('logIndex', 0)
+            block_number = log.get('blockNumber', 0)
+            
+            # 使用 trade_decoder 的解析方法
+            trade = self.trade_decoder._parse_order_filled_log(tx_hash, log_index, log)
+            
+            if trade:
+                return (trade, block_number)
+            
+            return None
+            
+        except Exception as e:
+            logger.warning(f"解析日志失败: {e}")
+            return None
+    
+    def process_logs_batch(self, logs: List[Dict]) -> List[Tuple[Trade, int]]:
+        """
+        批量处理日志
+        
+        Args:
+            logs: 日志列表
+            
+        Returns:
+            [(Trade, block_number), ...] 列表
         """
         trades = []
         
         for log in logs:
-            try:
-                # 使用TradeDecoder解码
-                tx_hash = log.get('transactionHash')
-                if tx_hash:
-                    decoded_trades = self.trade_decoder.decode_tx_logs(
-                        tx_hash.hex() if isinstance(tx_hash, bytes) else tx_hash
-                    )
-                    trades.extend([t for t in decoded_trades])
-            
-            except Exception as e:
-                logger.warning(f"解码交易 {log.get('transactionHash')} 失败: {e}")
-                continue
+            result = self.parse_log_to_trade(log)
+            if result:
+                trades.append(result)
         
         return trades
     
-    def enrich_with_market_info(self, trades: List[Dict]) -> List[Dict]:
+    def enrich_trades_with_market(self, trades: List[Tuple[Trade, int]]) -> List[Dict]:
         """
-        使用市场信息丰富交易数据
+        使用市场信息丰富交易数据，并转换为字典
         
         Args:
-            trades: 交易列表
+            trades: [(Trade, block_number), ...] 列表
             
         Returns:
-            丰富后的交易列表
+            丰富后的交易字典列表
         """
-        try:
-            conn = get_connection(self.db_path)
-            cursor = conn.cursor()
-            
-            enriched_trades = []
-            
-            for trade in trades:
-                try:
-                    token_id = trade.get('tokenId')
-                    
-                    # 查询市场
-                    cursor.execute("""
-                        SELECT market_slug, condition_id, yes_token_id, no_token_id
-                        FROM markets
-                        WHERE yes_token_id = ? OR no_token_id = ?
-                    """, (token_id, token_id))
-                    
-                    market_row = cursor.fetchone()
-                    if market_row:
-                        trade['market_slug'] = market_row[0]
-                        trade['condition_id'] = market_row[1]
-                        trade['outcome'] = 'YES' if token_id == market_row[2] else 'NO'
-                    
-                    enriched_trades.append(trade)
-                
-                except Exception as e:
-                    logger.warning(f"丰富交易数据失败: {e}")
-                    enriched_trades.append(trade)
-            
-            conn.close()
-            return enriched_trades
+        # 获取所有市场的 token ID 映射
+        token_to_market = self.store.get_token_to_market_mapping()
         
-        except Exception as e:
-            logger.error(f"丰富交易数据失败: {e}")
-            return trades
+        result = []
+        for trade, block_number in trades:
+            trade_dict = {
+                'tx_hash': trade.tx_hash,
+                'log_index': trade.log_index,
+                'exchange': trade.exchange,
+                'order_hash': trade.order_hash,
+                'maker': trade.maker,
+                'taker': trade.taker,
+                'maker_asset_id': trade.maker_asset_id,
+                'taker_asset_id': trade.taker_asset_id,
+                'maker_amount': trade.maker_amount,
+                'taker_amount': trade.taker_amount,
+                'fee': trade.fee,
+                'price': trade.price,
+                'token_id': trade.token_id,
+                'side': trade.side,
+                'block_number': block_number,
+                'market_slug': None,
+                'condition_id': None,
+                'outcome': None
+            }
+            
+            # 尝试关联市场信息
+            token_id = trade.token_id
+            if token_id in token_to_market:
+                market = token_to_market[token_id]
+                trade_dict['market_slug'] = market.get('slug')
+                trade_dict['condition_id'] = market.get('condition_id')
+                trade_dict['outcome'] = market.get('outcome')
+            
+            result.append(trade_dict)
+        
+        return result
     
-    def store_trades(self, trades: List[Dict]) -> int:
+    def store_trades(self, trade_dicts: List[Dict]) -> int:
         """
         存储交易到数据库
         
         Args:
-            trades: 交易列表
+            trade_dicts: 交易字典列表
             
         Returns:
             成功存储的交易数
         """
+        if not trade_dicts:
+            return 0
+        
+        return self.store.insert_trades(trade_dicts)
+    
+    def sync_markets_from_gamma(self, limit: int = 100) -> int:
+        """
+        从 Gamma API 同步热门市场
+        
+        Args:
+            limit: 获取市场数量
+            
+        Returns:
+            同步的市场数量
+        """
         try:
-            conn = get_connection(self.db_path)
-            cursor = conn.cursor()
+            logger.info(f"从 Gamma API 同步市场 (limit={limit})...")
             
-            stored_count = 0
+            markets = self.gamma_client.fetch_active_markets(limit=limit)
             
-            for trade in trades:
+            if not markets:
+                logger.warning("未获取到市场数据")
+                return 0
+            
+            synced = 0
+            for market_data in markets:
                 try:
-                    cursor.execute("""
-                        INSERT OR IGNORE INTO events (
-                            tx_hash, event_type, maker, taker, asset_yes, asset_no,
-                            size, price, block_number, timestamp, raw_data
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        trade.get('txHash'),
-                        'OrderFilled',
-                        trade.get('maker'),
-                        trade.get('taker'),
-                        trade.get('assetYes'),
-                        trade.get('assetNo'),
-                        float(trade.get('size', 0)),
-                        float(trade.get('price', 0)),
-                        trade.get('blockNumber'),
-                        datetime.now().isoformat(),
-                        json.dumps(trade)
-                    ))
+                    # 使用 market_decoder 计算 token IDs
+                    condition_id = market_data.get('conditionId')
+                    if not condition_id:
+                        continue
                     
-                    stored_count += 1
-                
+                    # 尝试从 clobTokenIds 获取
+                    clob_tokens = market_data.get('clobTokenIds')
+                    if clob_tokens:
+                        try:
+                            token_ids = json.loads(clob_tokens) if isinstance(clob_tokens, str) else clob_tokens
+                            yes_token = token_ids[0] if len(token_ids) > 0 else None
+                            no_token = token_ids[1] if len(token_ids) > 1 else None
+                        except:
+                            yes_token = None
+                            no_token = None
+                    else:
+                        # 使用 market_decoder 计算
+                        try:
+                            yes_token, no_token = self.market_decoder.derive_token_ids(condition_id)
+                        except:
+                            yes_token = None
+                            no_token = None
+                    
+                    market_record = {
+                        'slug': market_data.get('slug'),
+                        'question': market_data.get('question'),
+                        'condition_id': condition_id,
+                        'yes_token_id': yes_token,
+                        'no_token_id': no_token,
+                        'oracle': market_data.get('marketMakerAddress'),
+                        'collateral_token': '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',  # USDC.e
+                        'category': market_data.get('category'),
+                        'end_date': market_data.get('endDate'),
+                        'volume': market_data.get('volumeNum', 0),
+                        'liquidity': market_data.get('liquidityNum', 0),
+                        'active': market_data.get('active', True),
+                        'closed': market_data.get('closed', False),
+                        'resolved': False
+                    }
+                    
+                    self.store.upsert_market(market_record)
+                    synced += 1
+                    
                 except Exception as e:
-                    logger.warning(f"存储交易失败: {e}")
+                    logger.warning(f"同步市场失败: {e}")
                     continue
             
-            conn.commit()
-            conn.close()
+            logger.info(f"✓ 同步完成: {synced} 个市场")
+            return synced
             
-            logger.info(f"✓ 成功存储 {stored_count}/{len(trades)} 个交易")
-            return stored_count
-        
         except Exception as e:
-            logger.error(f"存储交易失败: {e}")
+            logger.error(f"同步市场失败: {e}")
             return 0
     
-    def run_indexer(self, from_block: Optional[int] = None, 
-                   to_block: Optional[int] = None,
-                   continuous: bool = False) -> Dict[str, Any]:
+    def run_batch(self, from_block: int, to_block: int) -> Dict[str, Any]:
+        """
+        处理单个批次
+        
+        Args:
+            from_block: 起始区块
+            to_block: 结束区块
+            
+        Returns:
+            批次处理结果
+        """
+        result = {
+            'from_block': from_block,
+            'to_block': to_block,
+            'logs_found': 0,
+            'trades_parsed': 0,
+            'trades_stored': 0
+        }
+        
+        # 1. 获取日志
+        logs = self.fetch_order_filled_logs(from_block, to_block)
+        result['logs_found'] = len(logs)
+        
+        if not logs:
+            return result
+        
+        # 2. 解析交易
+        trade_tuples = self.process_logs_batch(logs)
+        result['trades_parsed'] = len(trade_tuples)
+        
+        if not trade_tuples:
+            return result
+        
+        # 3. 丰富市场信息并转换为字典
+        trade_dicts = self.enrich_trades_with_market(trade_tuples)
+        
+        # 4. 存储
+        stored = self.store_trades(trade_dicts)
+        result['trades_stored'] = stored
+        
+        return result
+    
+    def run_indexer(self, 
+                    from_block: Optional[int] = None,
+                    to_block: Optional[int] = None,
+                    continuous: bool = False,
+                    sync_markets: bool = True) -> Dict[str, Any]:
         """
         运行索引器
         
@@ -273,141 +375,191 @@ class PolymarketIndexer:
             from_block: 起始区块（默认从同步状态读取）
             to_block: 结束区块（默认为最新区块）
             continuous: 是否持续运行
+            sync_markets: 是否先同步市场数据
             
         Returns:
             运行结果统计
         """
-        logger.info("启动索引器...")
+        logger.info("=" * 60)
+        logger.info("  🚀 启动 Polymarket 索引器")
+        logger.info("=" * 60)
         
-        # 获取区块范围
+        # 同步市场数据
+        if sync_markets:
+            self.sync_markets_from_gamma(limit=100)
+        
+        # 确定区块范围
+        current_block = self.get_current_block()
+        
         if from_block is None:
-            from_block, _ = self.get_sync_state()
+            sync_state = self.store.get_sync_state()
+            from_block = sync_state.get('last_block', current_block - 1000)
         
-        current_block = self.web3.eth.block_number
         if to_block is None:
             to_block = current_block
         
-        logger.info(f"处理区块范围: {from_block} - {to_block}")
+        logger.info(f"📊 处理区块范围: {from_block:,} - {to_block:,} ({to_block - from_block:,} 个区块)")
         
-        total_trades = 0
-        total_events, _ = self.get_sync_state()
+        # 统计
+        stats = {
+            'status': 'running',
+            'start_block': from_block,
+            'end_block': to_block,
+            'total_logs': 0,
+            'total_trades_parsed': 0,
+            'total_trades_stored': 0,
+            'batches_processed': 0,
+            'start_time': datetime.now().isoformat()
+        }
         
         # 分批处理
         batch_start = from_block
         
-        while batch_start < to_block:
-            batch_end = min(batch_start + self.BATCH_SIZE, to_block)
+        while batch_start <= to_block:
+            batch_end = min(batch_start + self.BATCH_SIZE - 1, to_block)
             
             try:
-                logger.info(f"处理批次: {batch_start} - {batch_end}")
+                logger.info(f"📦 处理批次: {batch_start:,} - {batch_end:,}")
                 
-                # 获取日志
-                logs = self.fetch_order_filled_logs(batch_start, batch_end)
+                result = self.run_batch(batch_start, batch_end)
                 
-                if logs:
-                    # 处理日志
-                    trades = self.process_logs(logs)
-                    
-                    # 丰富数据
-                    trades = self.enrich_with_market_info(trades)
-                    
-                    # 存储
-                    stored = self.store_trades(trades)
-                    total_trades += stored
+                stats['total_logs'] += result['logs_found']
+                stats['total_trades_parsed'] += result['trades_parsed']
+                stats['total_trades_stored'] += result['trades_stored']
+                stats['batches_processed'] += 1
+                
+                if result['logs_found'] > 0:
+                    logger.info(f"   ✓ 日志: {result['logs_found']}, "
+                               f"解析: {result['trades_parsed']}, "
+                               f"存储: {result['trades_stored']}")
                 
                 # 更新同步状态
-                self.update_sync_state(batch_end, total_events + total_trades)
+                self.store.update_sync_state(batch_end, stats['total_trades_stored'])
                 
                 batch_start = batch_end + 1
                 
-                logger.info(f"✓ 批次完成，累计存储 {total_trades} 个交易")
-            
             except Exception as e:
-                logger.error(f"批次处理失败: {e}")
+                logger.error(f"❌ 批次处理失败: {e}")
                 if not continuous:
-                    raise
+                    stats['status'] = 'error'
+                    stats['error'] = str(e)
+                    return stats
                 else:
+                    # 持续模式下跳过失败批次
                     batch_start = batch_end + 1
                     continue
         
-        logger.info(f"✓ 索引完成！总计处理 {total_trades} 个交易")
+        stats['status'] = 'completed'
+        stats['end_time'] = datetime.now().isoformat()
         
-        result = {
-            "status": "success",
-            "from_block": from_block,
-            "to_block": to_block,
-            "trades_inserted": total_trades
-        }
+        logger.info("=" * 60)
+        logger.info(f"✅ 索引完成!")
+        logger.info(f"   总日志: {stats['total_logs']:,}")
+        logger.info(f"   解析交易: {stats['total_trades_parsed']:,}")
+        logger.info(f"   存储交易: {stats['total_trades_stored']:,}")
+        logger.info("=" * 60)
         
-        # 持续模式
+        # 持续监听模式
         if continuous:
-            logger.info("进入持续监听模式...")
+            logger.info("🔄 进入持续监听模式...")
+            last_processed_block = to_block
+            
             while True:
                 try:
-                    import time
-                    time.sleep(12)  # Polygon出块间隔~12秒
+                    time.sleep(self.BLOCK_TIME)
                     
-                    # 监听最新区块
-                    latest_block = self.web3.eth.block_number
-                    if latest_block > batch_end:
-                        logger.info(f"发现新区块: {latest_block}")
-                        new_result = self.run_indexer(
-                            from_block=batch_end + 1,
-                            to_block=latest_block,
-                            continuous=False
-                        )
-                        batch_end = latest_block
-                        result['trades_inserted'] += new_result['trades_inserted']
+                    latest_block = self.get_current_block()
+                    
+                    if latest_block > last_processed_block:
+                        new_from = last_processed_block + 1
+                        logger.info(f"🆕 发现新区块: {new_from} - {latest_block}")
+                        
+                        result = self.run_batch(new_from, latest_block)
+                        
+                        stats['total_logs'] += result['logs_found']
+                        stats['total_trades_parsed'] += result['trades_parsed']
+                        stats['total_trades_stored'] += result['trades_stored']
+                        
+                        if result['trades_stored'] > 0:
+                            logger.info(f"   ✓ 新存储 {result['trades_stored']} 笔交易")
+                        
+                        self.store.update_sync_state(latest_block, stats['total_trades_stored'])
+                        last_processed_block = latest_block
                 
                 except KeyboardInterrupt:
-                    logger.info("用户中断索引器")
+                    logger.info("⏹ 用户中断，停止索引器")
                     break
                 except Exception as e:
                     logger.error(f"持续监听出错: {e}")
                     continue
+            
+            stats['status'] = 'stopped'
+            stats['end_time'] = datetime.now().isoformat()
         
-        return result
+        return stats
 
 
 def main():
     """命令行入口"""
-    parser = argparse.ArgumentParser(description="Polymarket区块链索引器")
+    parser = argparse.ArgumentParser(
+        description="Polymarket 区块链索引器",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  # 扫描最近 1000 个区块
+  python run.py
+  
+  # 从指定区块开始
+  python run.py --from-block 50000000
+  
+  # 持续监听新区块
+  python run.py --continuous
+  
+  # 只同步市场数据
+  python run.py --sync-markets-only
+"""
+    )
     parser.add_argument(
         "--rpc-url",
         type=str,
-        default=os.getenv("RPC_URL"),
+        default=os.getenv("RPC_URL", "https://polygon-rpc.com"),
         help="Polygon RPC URL"
     )
     parser.add_argument(
         "--db",
         type=str,
-        default="data/polymarket.db",
-        help="SQLite数据库路径"
+        default=os.getenv("DB_PATH", "data/polymarket.db"),
+        help="SQLite 数据库路径"
     )
     parser.add_argument(
         "--from-block",
         type=int,
         default=None,
-        help="起始区块"
+        help="起始区块（默认从同步状态读取）"
     )
     parser.add_argument(
         "--to-block",
         type=int,
         default=None,
-        help="结束区块"
+        help="结束区块（默认为最新区块）"
     )
     parser.add_argument(
         "--continuous",
         action="store_true",
         help="持续监听新区块"
     )
+    parser.add_argument(
+        "--no-sync-markets",
+        action="store_true",
+        help="跳过市场数据同步"
+    )
+    parser.add_argument(
+        "--sync-markets-only",
+        action="store_true",
+        help="只同步市场数据，不扫描区块"
+    )
     
     args = parser.parse_args()
-    
-    # 验证RPC_URL
-    if not args.rpc_url:
-        logger.error("错误: RPC_URL未配置。请设置RPC_URL环境变量或使用 --rpc-url 参数")
-        sys.exit(1)
     
     try:
         indexer = PolymarketIndexer(
@@ -415,16 +567,27 @@ def main():
             db_path=args.db
         )
         
-        result = indexer.run_indexer(
-            from_block=args.from_block,
-            to_block=args.to_block,
-            continuous=args.continuous
-        )
-        
-        logger.info(f"最终结果: {result}")
+        if args.sync_markets_only:
+            # 只同步市场
+            synced = indexer.sync_markets_from_gamma(limit=100)
+            logger.info(f"同步完成: {synced} 个市场")
+        else:
+            # 运行索引器
+            result = indexer.run_indexer(
+                from_block=args.from_block,
+                to_block=args.to_block,
+                continuous=args.continuous,
+                sync_markets=not args.no_sync_markets
+            )
+            
+            logger.info(f"最终结果: {json.dumps(result, indent=2, default=str)}")
     
+    except KeyboardInterrupt:
+        logger.info("用户中断")
     except Exception as e:
         logger.error(f"索引器运行失败: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 

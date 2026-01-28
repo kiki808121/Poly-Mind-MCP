@@ -51,8 +51,11 @@ class TradeDecoder:
     USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
     
     # OrderFilled 事件签名
+    # OrderFilled(bytes32 indexed orderHash, address indexed maker, address indexed taker, 
+    #             uint256 makerAssetId, uint256 takerAssetId, uint256 makerAmountFilled, 
+    #             uint256 takerAmountFilled, uint256 fee)
     ORDER_FILLED_TOPIC = Web3.keccak(
-        text="OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint8)"
+        text="OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)"
     ).hex()
     
     def __init__(self, rpc_url: str) -> None:
@@ -113,6 +116,13 @@ class TradeDecoder:
         """
         解析单个OrderFilled日志
         
+        OrderFilled 事件结构:
+        - topics[0]: 事件签名
+        - topics[1]: indexed orderHash (bytes32)
+        - topics[2]: indexed maker (address)
+        - topics[3]: indexed taker (address)
+        - data: makerAssetId(32) + takerAssetId(32) + makerAmountFilled(32) + takerAmountFilled(32) + fee(32)
+        
         Args:
             tx_hash: 交易哈希
             log_index: 日志索引
@@ -126,51 +136,73 @@ class TradeDecoder:
             data = log['data']
             topics = log.get('topics', [])
             
-            if len(topics) < 2:
+            # 验证是否为 OrderFilled 事件
+            if len(topics) < 4:
                 return None
             
-            # 从topics中提取信息（topics[0]是事件签名）
+            # 检查事件签名
+            topic0 = topics[0].hex() if hasattr(topics[0], 'hex') else str(topics[0])
+            if not topic0.startswith('d0a08e8c'):  # OrderFilled 签名前缀（不含0x）
+                return None
+            
+            # 从 topics 提取 indexed 参数
             order_hash = topics[1].hex() if hasattr(topics[1], 'hex') else str(topics[1])
             
-            # 从data中提取参数
-            # OrderFilled: (bytes32, address, address, uint256, uint256, uint256, uint8)
-            # data = orderHash(32) + maker(32) + taker(32) + makerAsset(32) + takerAsset(32) + makerAmount(32) + takerAmount(32) + fee(32)
+            # maker 和 taker 地址在 topics 中（需要取后 40 字符）
+            maker_topic = topics[2].hex() if hasattr(topics[2], 'hex') else str(topics[2])
+            taker_topic = topics[3].hex() if hasattr(topics[3], 'hex') else str(topics[3])
+            maker = Web3.to_checksum_address('0x' + maker_topic[-40:])
+            taker = Web3.to_checksum_address('0x' + taker_topic[-40:])
             
-            if len(data) < 290:  # 2 + 288 = 290 (包括0x前缀)
+            # 从 data 提取非 indexed 参数
+            # data 可能是 HexBytes 或字符串，统一转换为 hex 字符串
+            if hasattr(data, 'hex'):
+                data_hex = data.hex()  # HexBytes -> hex string (无 0x 前缀)
+            else:
+                data_hex = data[2:] if str(data).startswith('0x') else str(data)
+            
+            # 验证数据长度：5 个 uint256 = 5 * 32 bytes = 160 bytes = 320 hex chars
+            if len(data_hex) < 320:
+                logger.debug(f"Data too short: {len(data_hex)} < 320")
                 return None
             
-            # 解析地址和数值
-            maker = self._parse_address(data, 2, 42)  # 位置 2-42
-            taker = self._parse_address(data, 42, 82)  # 位置 42-82
+            # 解析各字段（每个 uint256 = 64 hex 字符 = 32 bytes）
+            maker_asset_id = int(data_hex[0:64], 16)
+            taker_asset_id = int(data_hex[64:128], 16)
+            maker_amount_raw = int(data_hex[128:192], 16)
+            taker_amount_raw = int(data_hex[192:256], 16)
+            fee_raw = int(data_hex[256:320], 16) if len(data_hex) >= 320 else 0
             
-            maker_asset_id = self._parse_hex(data, 82, 146)  # uint256
-            taker_asset_id = self._parse_hex(data, 146, 210)  # uint256
-            maker_amount = str(int(self._parse_hex(data, 210, 274), 16))
-            taker_amount = str(int(self._parse_hex(data, 274, 338), 16))
-            fee = str(int(self._parse_hex(data, 338, 402), 16)) if len(data) > 402 else "0"
+            # 转换为字符串（保持原始值用于存储）
+            maker_asset_id_str = str(maker_asset_id)
+            taker_asset_id_str = str(taker_asset_id)
+            maker_amount = str(maker_amount_raw)
+            taker_amount = str(taker_amount_raw)
+            fee = str(fee_raw)
             
             # 判断买卖方向
-            is_maker_usdc = maker_asset_id.lower() == "0x" + "0" * 64
-            is_taker_usdc = taker_asset_id.lower() == "0x" + "0" * 64
-            
-            if is_maker_usdc:
-                # Maker出USDC -> BUY
+            # makerAssetId = 0 表示 maker 出 USDC，即 maker 在买入 token
+            # takerAssetId = 0 表示 taker 出 USDC，即 maker 在卖出 token
+            if maker_asset_id == 0:
+                # Maker 出 USDC，买入 token -> BUY
                 side = "BUY"
-                token_id = taker_asset_id
+                token_id = taker_asset_id_str
+                # 价格 = USDC 数量 / Token 数量
                 price = self._calculate_price(
-                    Decimal(maker_amount),
-                    Decimal(taker_amount)
+                    Decimal(maker_amount_raw),
+                    Decimal(taker_amount_raw)
                 )
-            elif is_taker_usdc:
-                # Taker出USDC -> SELL
+            elif taker_asset_id == 0:
+                # Taker 出 USDC，maker 卖出 token -> SELL
                 side = "SELL"
-                token_id = maker_asset_id
+                token_id = maker_asset_id_str
                 price = self._calculate_price(
-                    Decimal(taker_amount),
-                    Decimal(maker_amount)
+                    Decimal(taker_amount_raw),
+                    Decimal(maker_amount_raw)
                 )
             else:
-                # 两个都不是USDC，跳过
+                # 两个都不是 USDC，跳过
+                logger.debug(f"Neither asset is USDC: maker={maker_asset_id}, taker={taker_asset_id}")
                 return None
             
             return Trade(
@@ -180,8 +212,8 @@ class TradeDecoder:
                 order_hash=order_hash,
                 maker=maker,
                 taker=taker,
-                maker_asset_id=maker_asset_id,
-                taker_asset_id=taker_asset_id,
+                maker_asset_id=maker_asset_id_str,
+                taker_asset_id=taker_asset_id_str,
                 maker_amount=maker_amount,
                 taker_amount=taker_amount,
                 fee=fee,

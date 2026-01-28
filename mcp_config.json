@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "polymind": {
+      "command": "python",
+      "args": ["-m", "src.mcp.mcp_server"],
+      "cwd": "C:\\Users\\28119\\Desktop\\Poly Mind MCP",
+      "env": {
+        "PYTHONPATH": "C:\\Users\\28119\\Desktop\\Poly Mind MCP"
+      }
+    }
+  }
+}

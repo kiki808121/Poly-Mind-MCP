@@ -106,8 +106,10 @@ class MCPServer:
         try:
             if method == "initialize":
                 return self._handle_initialize(req_id, params)
-            elif method == "initialized":
-                return None  # 通知消息，不需要响应
+            elif method == "initialized" or method == "notifications/initialized":
+                # 通知消息，不需要响应
+                logger.info("MCP 客户端已完成初始化")
+                return None
             elif method == "tools/list":
                 return self._handle_tools_list(req_id)
             elif method == "tools/call":
@@ -346,47 +348,36 @@ class MCPServer:
         return self._create_response(req_id, {"prompts": prompts})
     
     # =========================================================================
-    # 工具处理函数
+    # 工具处理函数 - 通过 execute_tool 统一调用
     # =========================================================================
     
     async def _handle_get_market_info(self, args: Dict) -> Dict:
         """获取市场信息"""
-        market_slug = args.get("market_slug", "")
-        return self.tools.get_market_info(market_slug)
+        return self.tools.execute_tool("get_market_info", args)
     
     async def _handle_search_markets(self, args: Dict) -> Dict:
         """搜索市场"""
-        query = args.get("query", "")
-        limit = args.get("limit", 10)
-        return self.tools.search_markets(query, limit)
+        return self.tools.execute_tool("search_markets", args)
     
     async def _handle_analyze_trader(self, args: Dict) -> Dict:
         """分析交易者"""
-        address = args.get("address", "")
-        return self.tools.analyze_trader(address)
+        return self.tools.execute_tool("analyze_trader", args)
     
     async def _handle_get_trading_advice(self, args: Dict) -> Dict:
         """获取交易建议"""
-        market_slug = args.get("market_slug", "")
-        user_intent = args.get("user_intent", "")
-        return self.tools.get_trading_advice(market_slug, user_intent)
+        return self.tools.execute_tool("get_trading_advice", args)
     
     async def _handle_find_arbitrage(self, args: Dict) -> Dict:
         """发现套利机会"""
-        min_profit = args.get("min_profit", 1.0)
-        return self.tools.find_arbitrage(min_profit)
+        return self.tools.execute_tool("find_arbitrage", args)
     
     async def _handle_get_smart_money(self, args: Dict) -> Dict:
         """获取聪明钱活动"""
-        market_slug = args.get("market_slug")
-        hours = args.get("hours", 24)
-        return self.tools.get_smart_money_activity(market_slug, hours)
+        return self.tools.execute_tool("get_smart_money_activity", args)
     
     async def _handle_get_hot_markets(self, args: Dict) -> Dict:
         """获取热门市场"""
-        sort_by = args.get("sort_by", "volume")
-        limit = args.get("limit", 10)
-        return self.tools.get_hot_markets(sort_by, limit)
+        return self.tools.execute_tool("get_hot_markets", args)
     
     async def _handle_analyze_relationship(self, args: Dict) -> Dict:
         """分析市场关系"""

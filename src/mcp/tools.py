@@ -33,7 +33,7 @@ class PolymarketTools:
         self.profiler = TraderProfiler()
         self.advisor = TradeAdvisor()
         self.gamma_base_url = os.getenv("GAMMA_BASE_URL", "https://gamma-api.polymarket.com")
-        self.db_path = os.getenv("DB_PATH", "polymarket.db")
+        self.db_path = os.getenv("DB_PATH", "data/polymarket.db")
     
     def get_tool_definitions(self) -> List[Dict]:
         """返回所有工具的定义（OpenAI Function Calling 格式）"""
@@ -408,19 +408,17 @@ class PolymarketTools:
             conn = get_connection(self.db_path)
             cursor = conn.cursor()
             
-            # 统计每个地址的交易胜率
-            # 简化版：统计每个地址的交易次数和平均盈利
+            # 统计每个地址的交易次数和总量
             query = """
                 SELECT 
                     maker as address,
                     COUNT(*) as trade_count,
-                    AVG(price) as avg_price,
-                    SUM(size) as total_size,
-                    MAX(timestamp) as last_trade
+                    AVG(CAST(price AS REAL)) as avg_price,
+                    SUM(CAST(maker_amount AS REAL)) as total_volume
                 FROM trades
                 GROUP BY maker
                 HAVING COUNT(*) >= 5
-                ORDER BY total_size DESC
+                ORDER BY total_volume DESC
                 LIMIT 20
             """
             cursor.execute(query)
@@ -429,11 +427,11 @@ class PolymarketTools:
             # 如果指定了市场，筛选该市场的活跃地址
             if market_slug:
                 cursor.execute("""
-                    SELECT DISTINCT t.maker, t.side, t.outcome, t.price, t.size, t.timestamp
+                    SELECT DISTINCT t.maker, t.side, t.outcome, t.price, t.maker_amount
                     FROM trades t
                     JOIN markets m ON t.market_id = m.id
                     WHERE m.slug = ?
-                    ORDER BY t.timestamp DESC
+                    ORDER BY t.id DESC
                     LIMIT 50
                 """, (market_slug,))
                 market_trades = cursor.fetchall()
@@ -451,8 +449,7 @@ class PolymarketTools:
                 address = row[0]
                 trade_count = row[1]
                 avg_price = float(row[2]) if row[2] else 0.5
-                total_size = float(row[3]) if row[3] else 0
-                last_trade = row[4]
+                total_volume = float(row[3]) / 1e6 if row[3] else 0  # USDC 6 decimals
                 
                 # 估算胜率（简化：基于平均价格）
                 estimated_win_rate = min(95, max(30, 50 + (0.5 - avg_price) * 100))
@@ -461,21 +458,23 @@ class PolymarketTools:
                     # 获取最近操作
                     recent = self._fetch_trades_by_address(address, limit=1)
                     recent_action = "N/A"
+                    last_active = ""
                     if recent:
                         recent_action = f"{recent[0].get('side', '?')} {recent[0].get('outcome', '?')}"
+                        last_active = recent[0].get('timestamp', '')
                         if recent[0].get('side') == 'BUY':
                             buy_count += 1
                         else:
                             sell_count += 1
                     
                     smart_money.append({
-                        "address": f"{address[:6]}...{address[-4:]}" if len(address) > 10 else address,
+                        "address": f"{address[:6]}...{address[-4:]}" if len(str(address)) > 10 else address,
                         "full_address": address,
                         "trade_count": trade_count,
                         "win_rate": round(estimated_win_rate, 1),
-                        "total_volume": round(total_size, 2),
+                        "total_volume": round(total_volume, 2),
                         "recent_action": recent_action,
-                        "last_active": last_trade
+                        "last_active": last_active
                     })
             
             # 生成摘要
@@ -559,11 +558,11 @@ class PolymarketTools:
             cursor.execute(
                 """
                 SELECT t.tx_hash, t.log_index, t.maker, t.taker, t.side, t.outcome,
-                       t.price, t.size, t.timestamp, m.slug
+                       t.price, t.maker_amount, t.taker_amount, t.timestamp, m.slug
                 FROM trades t
                 LEFT JOIN markets m ON t.market_id = m.id
                 WHERE t.maker = ? OR t.taker = ?
-                ORDER BY t.timestamp DESC
+                ORDER BY t.id DESC
                 LIMIT ?
                 """,
                 (address, address, limit)
@@ -574,17 +573,22 @@ class PolymarketTools:
 
             trades = []
             for row in rows:
+                # 计算 size 从 maker_amount 和 taker_amount
+                maker_amt = float(row[7]) if row[7] else 0
+                taker_amt = float(row[8]) if row[8] else 0
+                size = max(maker_amt, taker_amt) / 1e6  # USDC 6 decimals
+                
                 trades.append({
                     "tx_hash": row[0],
                     "log_index": row[1],
                     "maker": row[2],
                     "taker": row[3],
-                    "side": row[4],
+                    "side": row[4] or "BUY",
                     "outcome": row[5],
                     "price": float(row[6]) if row[6] is not None else 0.0,
-                    "size": float(row[7]) if row[7] is not None else 0.0,
-                    "timestamp": row[8],
-                    "market_slug": row[9] or "unknown"
+                    "size": size,
+                    "timestamp": row[9] or "",
+                    "market_slug": row[10] or "unknown"
                 })
 
             return trades

@@ -46,7 +46,7 @@
 
     <script type="text/babel">
         const { useState, useEffect, useCallback } = React;
-        const API_BASE = 'http://localhost:8891';
+        const API_BASE = 'http://localhost:8888';
 
         // Icons
         const Icons = {
@@ -173,7 +173,18 @@
                 setLoading(true);
                 try {
                     const res = await fetch(`${API_BASE}/smart-money?min_win_rate=55`);
-                    if (res.ok) { const data = await res.json(); setSmartMoney(data.smart_traders || data.traders || []); }
+                    if (res.ok) { 
+                        const data = await res.json(); 
+                        // 后端返回 smart_money_addresses，映射为前端期望的格式
+                        const traders = (data.smart_money_addresses || []).map(t => ({
+                            address: t.full_address || t.address,
+                            win_rate: (t.win_rate || 60) / 100,
+                            total_pnl: t.total_volume || 0,
+                            trade_count: t.trade_count || 0,
+                            style: t.recent_action || '未知'
+                        }));
+                        setSmartMoney(traders);
+                    }
                 } catch (e) {
                     setSmartMoney([
                         { address: '0x1234...abcd', win_rate: 0.72, total_pnl: 45600, trade_count: 156, style: '趋势追踪' },
